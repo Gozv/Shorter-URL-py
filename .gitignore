@@ -1,0 +1,38 @@
+# Entorno virtual
+venv/
+.env
+
+# Base de datos
+database.db
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.log
+*.pot
+*.pyc
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Testing
+.coverage
+htmlcov/
+
+# Docker
+docker-compose.yml
+.dockerignore
+
+# Otros
+.DS_Store
+Thumbs.db
+.env.local
+.env.development
+.env.test
+.env.production
