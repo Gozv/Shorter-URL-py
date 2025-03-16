@@ -1,34 +1,39 @@
 from flask import Flask, render_template, request, redirect, url_for, jsonify
 from datetime import datetime
-import sqlite3
 import uuid
 import validators
+from config import config
+from flask_sqlalchemy import SQLAlchemy
 
+# Inicialización de la aplicación
 app = Flask(__name__)
+app.config.from_object(config['development'])
 
-def get_db_connection():
-    conn = sqlite3.connect('database.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+# Configuración de la base de datos
+db = SQLAlchemy(app)
 
+class URL(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    original_url = db.Column(db.String(512), nullable=False)
+    short_code = db.Column(db.String(6), unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    visits = db.Column(db.Integer, default=0)
+
+# Comando CLI para inicializar la base de datos
+@app.cli.command()
 def init_db():
-    conn = get_db_connection()
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS urls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            original_url TEXT NOT NULL,
-            short_code TEXT UNIQUE NOT NULL,
-            created_at DATETIME NOT NULL,
-            visits INTEGER DEFAULT 0
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    """Initialize the database"""
+    with app.app_context():
+        db.create_all()
+    print("Database initialized!")
 
 def validate_url(url):
     if not validators.url(url):
         return False
     return url.startswith(('http://', 'https://'))
+
+def generate_short_code():
+    return uuid.uuid4().hex[:6]
 
 @app.route('/')
 def index():
@@ -41,22 +46,31 @@ def shorten_url():
     if not validate_url(original_url):
         return render_template('index.html', error='URL inválida'), 400
 
-    short_code = str(uuid.uuid4().hex)[:6]
-    created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    short_code = generate_short_code()
+    max_retries = 3
+    attempts = 0
 
-    conn = get_db_connection()
+    while attempts < max_retries:
+        existing_url = URL.query.filter_by(short_code=short_code).first()
+        if not existing_url:
+            break
+        short_code = generate_short_code()
+        attempts += 1
+    else:
+        return render_template('index.html', error='Error generando URL, intenta nuevamente'), 500
+
+    new_url = URL(
+        original_url=original_url,
+        short_code=short_code,
+        created_at=datetime.utcnow()
+    )
+
     try:
-        conn.execute('INSERT INTO urls (original_url, short_code, created_at) VALUES (?, ?, ?)',
-                    (original_url, short_code, created_at))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        # Regenerar código si hay colisión (muy improbable)
-        short_code = str(uuid.uuid4().hex)[:6]
-        conn.execute('INSERT INTO urls (original_url, short_code, created_at) VALUES (?, ?, ?)',
-                    (original_url, short_code, created_at))
-        conn.commit()
-    finally:
-        conn.close()
+        db.session.add(new_url)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return render_template('index.html', error='Error guardando URL'), 500
 
     shortened_url = request.host_url + short_code
     return render_template('shortened.html', 
@@ -65,18 +79,12 @@ def shorten_url():
 
 @app.route('/<short_code>')
 def redirect_short_url(short_code):
-    conn = get_db_connection()
-    url = conn.execute('SELECT original_url FROM urls WHERE short_code = ?',
-                      (short_code,)).fetchone()
-    conn.close()
+    url = URL.query.filter_by(short_code=short_code).first()
     
     if url:
-        conn = get_db_connection()
-        conn.execute('UPDATE urls SET visits = visits + 1 WHERE short_code = ?',
-                    (short_code,))
-        conn.commit()
-        conn.close()
-        return redirect(url['original_url'])
+        url.visits += 1
+        db.session.commit()
+        return redirect(url.original_url)
     else:
         return render_template('404.html'), 404
 
@@ -90,28 +98,52 @@ def api_shorten():
     if not validate_url(original_url):
         return jsonify({'error': 'URL inválida'}), 400
 
-    short_code = str(uuid.uuid4().hex)[:6]
-    created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    short_code = generate_short_code()
+    max_retries = 3
+    attempts = 0
 
-    conn = get_db_connection()
+    while attempts < max_retries:
+        existing_url = URL.query.filter_by(short_code=short_code).first()
+        if not existing_url:
+            break
+        short_code = generate_short_code()
+        attempts += 1
+    else:
+        return jsonify({'error': 'Error generando código único'}), 500
+
+    new_url = URL(
+        original_url=original_url,
+        short_code=short_code,
+        created_at=datetime.utcnow()
+    )
+
     try:
-        conn.execute('INSERT INTO urls (original_url, short_code, created_at) VALUES (?, ?, ?)',
-                    (original_url, short_code, created_at))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        short_code = str(uuid.uuid4().hex)[:6]
-        conn.execute('INSERT INTO urls (original_url, short_code, created_at) VALUES (?, ?, ?)',
-                    (original_url, short_code, created_at))
-        conn.commit()
-    finally:
-        conn.close()
+        db.session.add(new_url)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'Error interno del servidor'}), 500
 
     return jsonify({
         'original_url': original_url,
         'short_url': request.host_url + short_code,
-        'short_code': short_code
+        'short_code': short_code,
+        'visits': new_url.visits
     }), 201
 
+@app.route('/api/stats/<short_code>', methods=['GET'])
+def get_stats(short_code):
+    url = URL.query.filter_by(short_code=short_code).first()
+    if not url:
+        return jsonify({'error': 'URL no encontrada'}), 404
+    
+    return jsonify({
+        'created_at': url.created_at.isoformat(),
+        'visits': url.visits,
+        'original_url': url.original_url
+    })
+
 if __name__ == '__main__':
-    init_db()
-    app.run(debug=True)
+    with app.app_context():
+        db.create_all()
+    app.run(host='0.0.0.0')
